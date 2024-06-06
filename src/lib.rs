@@ -3,7 +3,8 @@ use std::array::{self, from_fn};
 use arrayvec::ArrayVec;
 use heapless::{Deque, FnvIndexMap};
 
-mod sound_io;
+pub mod sound_io;
+pub use sound_io::*;
 
 // TODO: think of what drawing features it actually needs.
 pub trait PaintBrush {
@@ -39,7 +40,7 @@ pub trait Gadget<
         &mut self,
         signal_in: [Option<&[f32]>; MAX_SIGNAL_IN],
         data_in: [Option<&Data>; MAX_DATA_IN],
-        sr: f32,
+        sr: u32,
         sample_n: usize,
     ) -> Output<MAX_SIGNAL_OUT, MAX_DATA_OUT, MIN_BUFF_SIZE>;
     fn input(&mut self, inpu_ctx: I);
@@ -57,9 +58,6 @@ struct Node<
     gadget: Box<
         dyn Gadget<MAX_SIGNAL_IN, MAX_SIGNAL_OUT, MAX_DATA_IN, MAX_DATA_OUT, MIN_BUFF_SIZE, P, I>,
     >,
-
-    output_idx: usize,
-
     signal_inputs: [Option<(usize, usize)>; MAX_SIGNAL_IN],
     data_inputs: [Option<(usize, usize)>; MAX_DATA_IN],
 }
@@ -85,13 +83,10 @@ pub struct ConnectionGraph<
     const MAX_NODES: usize,
 > {
     outputs: [Output<MAX_SIGNAL_OUT, MAX_DATA_OUT, MIN_BUFF_SIZE>; MAX_NODES],
-    outputs_used: [bool; MAX_NODES],
-
     nodes: [Option<
         Node<MAX_SIGNAL_IN, MAX_SIGNAL_OUT, MAX_DATA_IN, MAX_DATA_OUT, MIN_BUFF_SIZE, P, I>,
     >; MAX_NODES],
     execution_order: ArrayVec<usize, MAX_NODES>,
-    last_sample_n: usize,
 }
 
 pub struct Handle(usize);
@@ -113,10 +108,9 @@ impl<const MIN_BUFF_SIZE: usize, P: PaintBrush, I: InputCtx>
         MAX_NODES,
     >
 {
-    pub fn process(&mut self, sr: f32, sample_n: usize) {
-        let sample_n = sample_n as isize;
+    pub fn process(&mut self, sr: u32, sample_n: usize) {
+        let mut sample_n = sample_n as isize;
         while sample_n > 0 {
-
             for i in 0..MAX_NODES {
                 if let Some(ref mut node) = self.nodes[i] {
                     let mut signal_inputs: [Option<&[f32]>; MAX_SIGNAL_IN] =
@@ -124,7 +118,10 @@ impl<const MIN_BUFF_SIZE: usize, P: PaintBrush, I: InputCtx>
 
                     for (j, input) in node.signal_inputs.iter().enumerate() {
                         if let Some((in_node, in_port)) = input {
-                            signal_inputs[j] = Some(&self.outputs[*in_node].signals[*in_port][(self.last_sample_n % MIN_BUFF_SIZE)..MIN_BUFF_SIZE]);
+                            signal_inputs[j] = Some(
+                                &self.outputs[*in_node].signals[*in_port]
+                                    [0..(sample_n.min(MIN_BUFF_SIZE as isize) as usize)],
+                            );
                         }
                     }
 
@@ -135,9 +132,15 @@ impl<const MIN_BUFF_SIZE: usize, P: PaintBrush, I: InputCtx>
                             data_inputs[j] = self.outputs[*in_node].data[*in_port].as_ref();
                         }
                     }
-                    self.outputs[node.output_idx] = node.gadget.process(signal_inputs, data_inputs, sr, (sample_n as usize).min(MIN_BUFF_SIZE));
+                    self.outputs[i] = node.gadget.process(
+                        signal_inputs,
+                        data_inputs,
+                        sr,
+                        (sample_n as usize).min(MIN_BUFF_SIZE),
+                    );
                 }
             }
+            sample_n -= MIN_BUFF_SIZE as isize;
         }
     }
     pub fn add_node(
@@ -167,22 +170,10 @@ impl<const MIN_BUFF_SIZE: usize, P: PaintBrush, I: InputCtx>
             >,
         >,
     > {
-        let mut i = 0;
-        let output_idx = loop {
-            if !self.outputs_used[i] {
-                break i;
-            }
-            i += 1;
-            if i > MAX_NODES {
-                return Err(gadget);
-            }
-        };
-
         for j in 0..MAX_NODES {
             if let None = self.nodes[j] {
                 self.nodes[j] = Some(Node {
                     gadget,
-                    output_idx,
                     signal_inputs: [None; MAX_SIGNAL_IN],
                     data_inputs: [None; MAX_DATA_IN],
                 });
@@ -339,10 +330,8 @@ impl<const MIN_BUFF_SIZE: usize, P: PaintBrush, I: InputCtx>
                 data: [None; MAX_DATA_OUT],
                 signals: [[0.0; MIN_BUFF_SIZE]; MAX_SIGNAL_OUT],
             }; MAX_NODES],
-            outputs_used: [false; MAX_NODES],
             nodes: from_fn(|_| None),
             execution_order: ArrayVec::new(),
-            last_sample_n: MIN_BUFF_SIZE,
         }
     }
 }
@@ -387,8 +376,8 @@ mod tests {
             &mut self,
             _: [Option<&[f32]>; MAX_SIGNAL_IN],
             _: [Option<&Data>; MAX_DATA_IN],
-            _: f32,
-            _: usize
+            _: u32,
+            _: usize,
         ) -> Output<MAX_SIGNAL_OUT, MAX_DATA_OUT, MIN_BUFF_SIZE> {
             todo!()
         }
@@ -443,7 +432,6 @@ mod tests {
         println!("{:?}", graph.execution_order);
     }
 
-
     #[test]
     fn toposort_fail() {
         let mut graph: ConnectionGraph<32, 32, 32, 32, 32, Dummy, Dummy, 64> =
@@ -466,8 +454,8 @@ mod tests {
             .map_err(|_| "something went horribly wrong")
             .unwrap();
 
-        assert!(!(
-            graph.add_data_edge(&a, 0, &c, 0)
+        assert!(
+            !(graph.add_data_edge(&a, 0, &c, 0)
                 && graph.add_data_edge(&c, 0, &d, 0)
                 && graph.add_signal_edge(&d, 0, &a, 0))
                 && graph.add_data_edge(&b, 0, &c, 0)
