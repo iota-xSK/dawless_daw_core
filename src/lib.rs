@@ -33,7 +33,7 @@ pub trait Gadget<
     const MIN_BUFF_SIZE: usize,
     P: PaintBrush,
     I: InputCtx,
->
+>: Send
 {
     fn draw(&mut self, brush: P);
     fn process(
